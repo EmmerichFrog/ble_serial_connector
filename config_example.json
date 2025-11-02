@@ -1,0 +1,6 @@
+{
+    "host": "your_server",
+    "token": "your HA login token",
+    "entity_id": "custom_name",
+    "can add as many as needed": "rename file to config.json"
+}

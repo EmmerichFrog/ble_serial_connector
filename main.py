@@ -1,6 +1,8 @@
 import asyncio
 import json
 import struct
+from time import perf_counter
+from typing import Any, NoReturn
 import bleak
 from httpx import AsyncClient
 from rich import print
@@ -10,6 +12,7 @@ from bleak.backends.scanner import AdvertisementData
 from bleak.backends.device import BLEDevice
 from bleak.args.bluez import BlueZDiscoveryFilters, BlueZScannerArgs
 
+WDOG_TIMEOUT = 20  # Seconds
 ADDRESS = "80:E1:26:1D:3D:92"
 UUID_WRITE = "19ed82ae-ed21-4c9d-4145-228e62fe0000"
 UUID_READ = "19ed82ae-ed21-4c9d-4145-228e61fe0000"
@@ -20,7 +23,7 @@ host = ""
 token = ""
 
 
-def prepare_data(data_dict):
+def prepare_data(data_dict) -> list[Any]:
     data = list()
     data.append(float(data_dict["bt"]))
     data.append(float(data_dict["bh"]))
@@ -36,7 +39,7 @@ def prepare_data(data_dict):
     return data
 
 
-async def get_sensors(client: AsyncClient):
+async def get_sensors(client: AsyncClient) -> list[Any]:
     r = await client.get(
         f"{host}/api/states",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
@@ -69,33 +72,51 @@ def short_to_long_entity(short_entity: str) -> str | None:
 
 
 class Comm:
-    def __init__(self) -> None:
+    def __init__(self, address: str) -> None:
+        self.address = address
+
         self.client = None
         self.detected = False
         self.connected = False
         self.http_client = AsyncClient()
+        self.detected_ts = 0.0
+        self.last_write_ts = 0.0
 
-    async def detection_cb(self, device: BLEDevice, advertisement_data: AdvertisementData):
+    async def watchdog(self) -> None:
+        while True:
+            if self.detected and not self.connected and (perf_counter() - self.detected_ts > WDOG_TIMEOUT):
+                print("Connection timeout, aborting")
+                break
+            if self.connected and (perf_counter() - self.last_write_ts > WDOG_TIMEOUT):
+                print("Write timeout, aborting")
+                break
+
+            await asyncio.sleep(1.0)
+
+        await self.disconnect()
+
+    async def detection_cb(self, device: BLEDevice, advertisement_data: AdvertisementData) -> None:
         # print(device.address, device.name, advertisement_data)
-        if device.address == ADDRESS and not self.detected:
+        if device.address == self.address and not self.detected:
             print(f"Detected: {device.address}")
             self.detected = True
+            self.detected_ts = perf_counter()
             await self.connect(device)
 
-    async def connect(self, device: BLEDevice):
+    async def connect(self, device: BLEDevice) -> None:
         self.client = BleakClient(device, timeout=10, pair=False)
         await self.client.connect()
         self.connected = True
         print(f"Connected: {self.client.is_connected}")
 
-    async def disconnect(self):
+    async def disconnect(self) -> None:
         if not self.connected:
             self.detected = False
             self.connected = False
             await self.client.disconnect()  # type: ignore
             self.client = None
 
-    async def read_cb(self, characteristic: BleakGATTCharacteristic, data: bytearray):
+    async def read_cb(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         read_cmds = data.decode("ascii").split("|")
         cmds_dict = dict()
         for cmd in read_cmds:
@@ -117,10 +138,11 @@ class Comm:
         try:
             while self.connected:
                 sensors = await get_sensors(self.http_client)
-                print(f"Sending: {sensors}")
+                # print(f"Sending: {sensors}")
                 buffer = struct.pack(FORMAT, *sensors)
                 await self.client.write_gatt_char(UUID_WRITE, buffer, False)  # type: ignore
-                print("Sent.")
+                self.last_write_ts = perf_counter()
+                # print("Sent.")
                 await asyncio.sleep(5.0)
 
         except bleak.exc.BleakError as e:  # type: ignore
@@ -131,18 +153,18 @@ class Comm:
             await self.disconnect()
 
 
-async def main(address: str):
-    comm = Comm()
-    filters = BlueZDiscoveryFilters(Transport="le", DuplicateData=True)
-    scanner = BleakScanner(comm.detection_cb, bluez=BlueZScannerArgs(filters=filters))
+async def main(address: str) -> NoReturn:
     while True:
+        comm = Comm(address)
+        filters = BlueZDiscoveryFilters(Transport="le", DuplicateData=True)
+        scanner = BleakScanner(comm.detection_cb, bluez=BlueZScannerArgs(filters=filters))
         await scanner.start()
         while not comm.connected:
             await asyncio.sleep(5.0)
 
         await scanner.stop()
         await comm.client.start_notify(UUID_READ, comm.read_cb)  # type: ignore
-        _ = await asyncio.gather(comm.write())
+        _ = await asyncio.gather(comm.write(), comm.watchdog())
 
 
 if __name__ == "__main__":

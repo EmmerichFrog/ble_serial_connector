@@ -105,7 +105,8 @@ class Comm:
 
     async def connect(self, device: BLEDevice) -> None:
         self.client = BleakClient(device, timeout=10, pair=False)
-        await self.client.connect()
+        await asyncio.wait_for(self.client.connect(), WDOG_TIMEOUT)
+        self.last_write_ts = perf_counter()
         self.connected = True
         print(f"Connected: {self.client.is_connected}")
 
@@ -158,9 +159,16 @@ async def main(address: str) -> NoReturn:
         comm = Comm(address)
         filters = BlueZDiscoveryFilters(Transport="le", DuplicateData=True)
         scanner = BleakScanner(comm.detection_cb, bluez=BlueZScannerArgs(filters=filters))
+        try:
+            await scanner.stop()
+        except:
+            pass
+
+        await asyncio.sleep(5.0)
+
         await scanner.start()
         while not comm.connected:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(1.0)
 
         await scanner.stop()
         await comm.client.start_notify(UUID_READ, comm.read_cb)  # type: ignore
